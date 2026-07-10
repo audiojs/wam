@@ -29,7 +29,7 @@
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {
-    "web-audio-api": "file:../../web-audio-api"
+    "web-audio-api": "^1.5.1"
   },
   "publishConfig": {
     "access": "public"
