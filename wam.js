@@ -14,8 +14,9 @@ const kebab = (s) => s.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase()
 const buildParamSpecs = (params) =>
   Object.entries(params).map(([name, p]) => {
     const type = p.type ?? 'number'
+    const restart = !!(p.flags && p.flags.includes('restart'))
     if (type === 'number') return {
-      name, type,
+      name, type, restart,
       default: p.default ?? 0,
       min: p.min ?? PARAM_FLOAT_MIN,
       max: p.max ?? PARAM_FLOAT_MAX,
@@ -23,12 +24,12 @@ const buildParamSpecs = (params) =>
       smoothing: p.smoothing ?? 0
     }
     if (type === 'enum') return {
-      name, type,
+      name, type, restart,
       values: p.values ?? [],
       default: p.default ?? (p.values?.[0] ?? null)
     }
     if (type === 'bool') return {
-      name, type,
+      name, type, restart,
       default: p.default ?? false
     }
     throw new Error(`toWam: unknown param type "${type}" for "${name}"`)
@@ -104,6 +105,15 @@ class Processor extends AudioWorkletProcessor {
     this._numNames = []
     this._nonNum = {}
     this._smooth = null
+    // restart-flagged params (flags: ['restart']): a change swaps in a
+    // freshly-factoried process fn (state resets — the documented semantic).
+    // _restart covers every type (checked on message arrival for enum/bool);
+    // _restartNum/_restartLive are the cheap per-block change detector for
+    // numeric restart params, since those arrive via the AudioParam array.
+    this._restart = {}
+    this._restartNum = []
+    this._restartLive = {}
+    this._pendingRestart = false
     for (const s of SPECS) {
       if (s.type === 'number') {
         const seed = numericInit[s.name] !== undefined ? numericInit[s.name] : s.default
@@ -112,11 +122,13 @@ class Processor extends AudioWorkletProcessor {
         if (s.smoothing > 0 && s.rate === 'k-rate')
           (this._smooth || (this._smooth = {}))[s.name] =
             { time: s.smoothing, from: seed, target: seed, t: 1, init: false, buf: new Float32Array([seed]) }
+        if (s.restart) { this._restart[s.name] = true; this._restartNum.push(s.name); this._restartLive[s.name] = seed }
       } else {
         const seed = nonNumInit[s.name] !== undefined ? nonNumInit[s.name] : s.default
         ctxParams[s.name] = seed
         this._params[s.name] = seed
         this._nonNum[s.name] = true
+        if (s.restart) this._restart[s.name] = true
       }
     }
     this._frames = 0
@@ -140,9 +152,43 @@ class Processor extends AudioWorkletProcessor {
     this._proc = factory(ctx)
     const lat = typeof factory.latency === 'function' ? factory.latency(ctx) | 0 : factory.latency | 0
     if (lat) this.port.postMessage({ type: 'latency', value: lat })
+    // Re-run the factory against a fresh ctx.params snapshot built from the
+    // live values (this._params doubles as that snapshot: numeric names hold
+    // the current block's Float32Array, non-numeric hold the raw value) —
+    // same shape as first construction, so the swapped-in process fn starts
+    // from a clean closure exactly like a reinstantiated instance would.
+    this._rebuild = () => {
+      const rp = {}
+      for (const s of SPECS) {
+        rp[s.name] = s.type === 'number'
+          ? new Float32Array([this._params[s.name] ? this._params[s.name][0] : s.default])
+          : (this._params[s.name] !== undefined ? this._params[s.name] : s.default)
+      }
+      const rctx = {
+        sampleRate,
+        maxBlockSize: 128,
+        render: po.render || 'realtime',
+        duration: po.duration,
+        params: rp,
+        transport: undefined,
+        layouts: undefined,
+        events: factory.events && factory.events.in && factory.events.in.length ? [] : undefined,
+        get currentTime() { return self._frames / sampleRate },
+        emit: (name, ...args) => {
+          if (!emits || !(name in emits)) throw new Error('emit: "' + name + '" not declared in events.out')
+          self.port.postMessage({ type: 'emit', name, args })
+        }
+      }
+      this._proc = factory(rctx)
+      const rlat = typeof factory.latency === 'function' ? factory.latency(rctx) | 0 : factory.latency | 0
+      this.port.postMessage({ type: 'latency', value: rlat })
+    }
     this.port.onmessage = (e) => {
       const d = e.data
-      if (d && d.type === 'param' && this._nonNum[d.name] === true) this._params[d.name] = d.value
+      if (d && d.type === 'param' && this._nonNum[d.name] === true) {
+        this._params[d.name] = d.value
+        if (this._restart[d.name]) this._pendingRestart = true
+      }
     }
   }
   process(inputs, outputs, params) {
@@ -151,6 +197,15 @@ class Processor extends AudioWorkletProcessor {
       const k = this._numNames[i]
       p[k] = params[k]
     }
+    // Cheap restart-change detection: only iterates declared restart params
+    // (empty for atoms with none), comparing against the last seen scalar.
+    let restartDirty = this._pendingRestart
+    for (let i = 0; i < this._restartNum.length; i++) {
+      const k = this._restartNum[i]
+      const v = p[k][0]
+      if (this._restartLive[k] !== v) { this._restartLive[k] = v; restartDirty = true }
+    }
+    if (restartDirty) { this._rebuild(); this._pendingRestart = false }
     const frames = outputs[0] && outputs[0][0] ? outputs[0][0].length : 128
     if (this._smooth) for (const k in this._smooth) {
       const s = this._smooth[k], target = params[k][0]
@@ -201,6 +256,8 @@ const installProcessor = (scope, factory, id, specs) => {
 export function toWam(factory, opts = {}) {
   const id = opts.id ?? factory.id ?? (factory.name && kebab(factory.name))
   if (!id) throw new Error('toWam: factory needs an id (set factory.id or use a named export)')
+  if (factory.streaming === false)
+    throw new Error(`toWam(atom): ${id} declares streaming: false (whole-render) — it cannot run as a realtime worklet; render it offline via audio/batch`)
 
   const specs = buildParamSpecs(factory.params ?? {})
   const buses = resolveBuses(factory.channels)

@@ -24,4 +24,6 @@ node.dispose()                      // releases the MessagePort (needed after of
 
 Any package exposing an `audio.js` manifest (the `"audio"` field in its package.json) works — see the [contract](https://github.com/audiojs/compile/blob/main/CONTRACT.md).
 
+`flags: ['restart']` params (attack/release-style coefficients baked at factory time) actually restart: a live `setParam` on a restart-flagged param re-runs the atom factory against a fresh `ctx.params` snapshot and swaps in the new process fn — state resets, matching the contract's "reconfigure = new instance" lifecycle rule. `streaming: false` (whole-render) atoms are refused at `toWam()` — they hold the entire timeline, so wrapping one in a 128-frame worklet would silently produce wrong output; render those offline via [`audio/batch`](https://github.com/audiojs/audio) instead.
+
 For batch/stream hosting without an AudioContext see [`audio/batch`](https://github.com/audiojs/audio); for compiling atoms to native plugin formats (CLAP, VST3, AU, LV2) see [`@audio/compile`](https://github.com/audiojs/compile).
