@@ -135,7 +135,8 @@ test('offline render is detected and ctx.render reaches the factory', async () =
   src.connect(node).connect(ctx.destination)
   src.start()
   await ctx.startRendering()
-  await new Promise(r => setImmediate(r))
+  // port message delivery lands later than one tick on node 18/20 — poll briefly
+  for (let i = 0; i < 40 && !emitted.length; i++) await new Promise(r => setTimeout(r, 5))
   node.dispose()
   assert.deepEqual(emitted, [['meter', 1]])
 })
